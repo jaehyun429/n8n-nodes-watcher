@@ -10,7 +10,7 @@
 		"watcher-version"
 	],
 	"author": {
-		"name": "Jaehyun Jeong",
+		"name": "Jaehyun Jong",
 		"email": "mhgrid@naver.com"
 	},
 	"repository": {
@@ -52,3 +52,5 @@
 		"n8n-workflow": "*"
 	}
 }
+
+ 
