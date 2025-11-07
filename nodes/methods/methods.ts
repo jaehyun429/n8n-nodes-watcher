@@ -1,27 +1,9 @@
+import FirecrawlApp from '@mendable/firecrawl-js';
 import { IExecuteFunctions, INodeExecutionData, NodeOperationError, IDataObject } from 'n8n-workflow';
 
-// Helper function for delays
-const sleep = (ms: number): Promise<void> => {
-	return new Promise(resolve => {
-		setTimeout(resolve, ms);
-	});
-};
-
-// Helper function for GitHub API calls
-async function fetchGitHubAPI(url: string): Promise<any> {
-	const response = await fetch(url, {
-		headers: {
-			'Accept': 'application/vnd.github+json',
-			'User-Agent': 'n8n-node-checker',
-		}
-	});
-	
-	if (!response.ok) {
-		throw new Error(`GitHub API error: ${response.status}`);
-	}
-	
-	return await response.json();
-}
+// Global functions declaration for Node.js environment
+declare const fetch: typeof globalThis.fetch;
+declare const setTimeout: typeof globalThis.setTimeout;
 
 interface CommunityNodeResult extends IDataObject {
 	type: 'community';
@@ -55,9 +37,23 @@ export const nodeUpdateCheckerMethods = {
 	async execute(this: IExecuteFunctions): Promise<INodeExecutionData[][]> {
 		const returnData: INodeExecutionData[] = [];
 
+		// Get credentials (optional now)
+		let firecrawl: FirecrawlApp | undefined;
+		try {
+			const credentials = await this.getCredentials('firecrawlApi');
+			if (credentials && credentials.apiKey) {
+				const apiKey = credentials.apiKey as string;
+				firecrawl = new FirecrawlApp({ apiKey });
+			}
+		} catch (error) {
+			// Credentials not provided, continue without Firecrawl
+			firecrawl = undefined;
+		}
+
 		// Get parameters
 		const operation = this.getNodeParameter('operation', 0) as string;
 		const outputFormat = this.getNodeParameter('outputFormat', 0) as string;
+		const packageNamesInput = this.getNodeParameter('packageNames', 0, '') as string;
 		const previousVersionsInput = this.getNodeParameter('previousVersions', 0, '{}') as string;
 		const useStaticData = this.getNodeParameter('options.useStaticData', 0, false) as boolean;
 		
@@ -89,41 +85,23 @@ export const nodeUpdateCheckerMethods = {
 		const fetchGithubRepo = options.fetchGithubRepo !== false;
 		const extractPatchNotes = options.extractPatchNotes !== false;
 
-		// Get current workflow
+		// Get current workflow metadata
 		const workflow = this.getWorkflow();
 		
-		// Get all nodes from the workflow
-		let allNodes: any[] = [];
-		try {
-			const workflowData = workflow as any;
-			if (workflowData.nodes && Array.isArray(workflowData.nodes)) {
-				allNodes = workflowData.nodes;
-			} else if (workflowData.nodes && typeof workflowData.nodes === 'object') {
-				allNodes = Object.values(workflowData.nodes);
-			} else {
-				allNodes = [];
-			}
-		} catch (error) {
-			allNodes = [];
-		}
-
-		// Separate community nodes and base nodes
+		// Parse package names from input
 		const communityNodes: string[] = [];
 		const baseNodes: string[] = [];
-
-		for (const node of allNodes) {
-			if (!node || typeof node !== 'object') continue;
-			const nodeData = node as any;
-			const nodeType = nodeData.type;
-			
-			if (!nodeType) continue;
-			
-			if (nodeType.startsWith('@') || nodeType.includes('n8n-nodes-')) {
+		
+		if (packageNamesInput.trim()) {
+			const packages = packageNamesInput.split(',').map(p => p.trim()).filter(p => p);
+			for (const pkg of packages) {
+				// Add .node suffix if not present
+				const nodeType = pkg.includes('.') ? pkg : `${pkg}.node`;
 				communityNodes.push(nodeType);
-			} else {
-				baseNodes.push(nodeType);
 			}
 		}
+		
+		console.log('Packages to check:', communityNodes);
 
 		const communityResults: CommunityNodeResult[] = [];
 		const baseResults: BaseNodeResult[] = [];
@@ -133,14 +111,17 @@ export const nodeUpdateCheckerMethods = {
 			if (operation === 'checkAll' || operation === 'checkCommunity') {
 				for (const nodeType of [...new Set(communityNodes)]) {
 					try {
-						const result = await checkCommunityNode(
+						const result = await checkCommunityNode.call(
+							this,
+							firecrawl,
 							nodeType,
 							previousVersions,
 							fetchGithubRepo,
 							checkDelay,
 						);
 						communityResults.push(result);
-						await sleep(checkDelay);
+						// Use proper setTimeout without global prefix in Node.js environment
+						await new Promise<void>(resolve => setTimeout(() => resolve(), checkDelay));
 					} catch (error) {
 						communityResults.push({
 							type: 'community',
@@ -159,14 +140,8 @@ export const nodeUpdateCheckerMethods = {
 
 			// Check base nodes on n8n GitHub
 			if ((operation === 'checkAll' || operation === 'checkBase') && baseNodes.length > 0) {
-				try {
-					const baseNodeResults = await checkBaseNodes(
-						baseNodes,
-						extractPatchNotes,
-						checkDelay,
-					);
-					baseResults.push(...baseNodeResults);
-				} catch (error) {
+				if (!firecrawl) {
+					// Skip base node checking if Firecrawl is not configured
 					baseResults.push({
 						type: 'base',
 						nodeType: 'all',
@@ -175,9 +150,32 @@ export const nodeUpdateCheckerMethods = {
 						mentionedInRecentCommits: false,
 						githubReleasesUrl: '',
 						githubCommitsUrl: '',
-						error: error instanceof Error ? error.message : String(error),
+						error: 'Firecrawl API credentials required for base node checking',
 						success: false,
 					});
+				} else {
+					try {
+						const baseNodeResults = await checkBaseNodes.call(
+							this,
+							firecrawl,
+							baseNodes,
+							extractPatchNotes,
+							checkDelay,
+						);
+						baseResults.push(...baseNodeResults);
+					} catch (error) {
+						baseResults.push({
+							type: 'base',
+							nodeType: 'all',
+							nodeName: 'all',
+							mentionedInRecentReleases: false,
+							mentionedInRecentCommits: false,
+							githubReleasesUrl: '',
+							githubCommitsUrl: '',
+							error: error instanceof Error ? error.message : String(error),
+							success: false,
+						});
+					}
 				}
 			}
 
@@ -207,7 +205,7 @@ export const nodeUpdateCheckerMethods = {
 
 			// Add summary
 			const summary = {
-				totalNodes: allNodes.length,
+				totalPackages: communityNodes.length + baseNodes.length,
 				communityNodesCount: communityNodes.length,
 				baseNodesCount: baseNodes.length,
 				communityNodesWithUpdates: communityResults.filter(r => r.hasUpdate).length,
@@ -269,6 +267,8 @@ export const nodeUpdateCheckerMethods = {
 
 // Helper functions
 async function checkCommunityNode(
+	this: IExecuteFunctions,
+	firecrawl: FirecrawlApp | undefined,
 	nodeType: string,
 	previousVersions: Record<string, string>,
 	fetchGithubRepo: boolean,
@@ -277,10 +277,11 @@ async function checkCommunityNode(
 	const packageName = nodeType.split('.')[0];
 	const npmUrl = `https://www.npmjs.com/package/${packageName}`;
 	
-	// Use npm registry API
+	// Use npm registry API instead of scraping
 	const registryUrl = `https://registry.npmjs.org/${packageName}`;
 	
 	try {
+		// Fetch from npm registry API
 		const response = await fetch(registryUrl);
 		
 		if (!response.ok) {
@@ -289,7 +290,7 @@ async function checkCommunityNode(
 		
 		const registryData = await response.json() as any;
 		
-		// Get latest version
+		// Get latest version from dist-tags
 		const currentVersion = registryData['dist-tags']?.latest || 'unknown';
 		
 		// Get last publish time
@@ -344,13 +345,20 @@ async function checkCommunityNode(
 			}
 		}
 		
-		// Try to get changelog from GitHub API if there's an update
+		// Try to get changelog if there's an update
 		let changelog: string | undefined;
-		if (hasUpdate && githubUrl) {
+		if (hasUpdate && githubUrl && firecrawl) {
 			try {
-				await sleep(checkDelay);
-				changelog = await getChangelogFromGitHub(
-					githubUrl,
+				await new Promise<void>(resolve => setTimeout(() => resolve(), checkDelay));
+				const changelogUrl = `${githubUrl}/releases`;
+				const changelogResponse = await firecrawl.scrapeUrl(changelogUrl, {
+					formats: ['markdown'],
+				});
+				const changelogContent = (changelogResponse as any).markdown || '';
+				
+				// Extract relevant release notes
+				changelog = extractRelevantChangelog(
+					changelogContent,
 					previousVersion || '',
 					currentVersion,
 				);
@@ -374,6 +382,7 @@ async function checkCommunityNode(
 		};
 		
 	} catch (error) {
+		// Fallback to unknown if API fails
 		return {
 			type: 'community',
 			nodeType,
@@ -389,149 +398,110 @@ async function checkCommunityNode(
 	}
 }
 
-async function getChangelogFromGitHub(
-	githubUrl: string,
-	previousVersion: string,
-	currentVersion: string,
-): Promise<string | undefined> {
-	try {
-		// Extract owner and repo from GitHub URL
-		const match = githubUrl.match(/github\.com\/([^\/]+)\/([^\/]+)/);
-		if (!match) return undefined;
-		
-		const [, owner, repo] = match;
-		
-		// Fetch releases from GitHub API
-		const releases = await fetchGitHubAPI(
-			`https://api.github.com/repos/${owner}/${repo}/releases`
-		);
-		
-		if (!Array.isArray(releases) || releases.length === 0) {
-			return undefined;
-		}
-		
-		// Find release matching current version
-		const currentRelease = releases.find((r: any) => 
-			r.tag_name === currentVersion || 
-			r.tag_name === `v${currentVersion}` ||
-			r.name?.includes(currentVersion)
-		);
-		
-		if (!currentRelease || !currentRelease.body) {
-			return undefined;
-		}
-		
-		// Return changelog, truncated if too long
-		let changelog = currentRelease.body;
-		if (changelog.length > 2000) {
-			changelog = changelog.substring(0, 2000) + '...';
-		}
-		
-		return changelog;
-		
-	} catch (error) {
-		return undefined;
-	}
-}
-
 async function checkBaseNodes(
+	this: IExecuteFunctions,
+	firecrawl: FirecrawlApp,
 	baseNodes: string[],
 	extractPatchNotes: boolean,
 	checkDelay: number,
 ): Promise<BaseNodeResult[]> {
 	const results: BaseNodeResult[] = [];
 
-	try {
-		// Fetch n8n releases from GitHub API
-		const releases = await fetchGitHubAPI(
-			'https://api.github.com/repos/n8n-io/n8n/releases?per_page=10'
-		);
+	// Crawl n8n GitHub releases page
+	const githubReleasesUrl = 'https://github.com/n8n-io/n8n/releases';
+	const githubResponse = await firecrawl.scrapeUrl(githubReleasesUrl, {
+		formats: ['markdown'],
+	});
+	const releasesContent = (githubResponse as any).markdown || '';
+
+	await new Promise<void>(resolve => setTimeout(() => resolve(), checkDelay));
+
+	// Crawl commits page
+	const nodesCommitsUrl = 'https://github.com/n8n-io/n8n/commits/master/packages/nodes-base/nodes';
+	const commitsResponse = await firecrawl.scrapeUrl(nodesCommitsUrl, {
+		formats: ['markdown'],
+	});
+	const commitsContent = (commitsResponse as any).markdown || '';
+
+	// Check each base node
+	for (const nodeType of [...new Set(baseNodes)]) {
+		const nodeName = nodeType.split('.').pop() || nodeType;
 		
-		await sleep(checkDelay);
+		const mentionedInReleases = releasesContent.toLowerCase().includes(nodeName.toLowerCase());
+		const mentionedInCommits = commitsContent.toLowerCase().includes(nodeName.toLowerCase());
 
-		// Fetch recent commits from GitHub API
-		const commits = await fetchGitHubAPI(
-			'https://api.github.com/repos/n8n-io/n8n/commits?path=packages/nodes-base/nodes&per_page=30'
-		);
-
-		// Combine release notes and commit messages for searching
-		const releasesContent = releases.map((r: any) => 
-			`${r.name || ''} ${r.body || ''}`
-		).join('\n').toLowerCase();
-		
-		const commitsContent = commits.map((c: any) => 
-			c.commit?.message || ''
-		).join('\n').toLowerCase();
-
-		// Check each base node
-		for (const nodeType of [...new Set(baseNodes)]) {
-			const nodeName = nodeType.split('.').pop() || nodeType;
-			const lowerNodeName = nodeName.toLowerCase();
-			
-			const mentionedInReleases = releasesContent.includes(lowerNodeName);
-			const mentionedInCommits = commitsContent.includes(lowerNodeName);
-
-			let patchNotes: string | undefined;
-			if (extractPatchNotes && (mentionedInReleases || mentionedInCommits)) {
-				patchNotes = extractPatchNotesFromGitHub(
-					releases,
-					commits,
-					nodeName,
-				);
-			}
-
-			results.push({
-				type: 'base',
-				nodeType,
+		let patchNotes: string | undefined;
+		if (extractPatchNotes && (mentionedInReleases || mentionedInCommits)) {
+			patchNotes = extractPatchNotesFromContent(
+				releasesContent,
+				commitsContent,
 				nodeName,
-				mentionedInRecentReleases: mentionedInReleases,
-				mentionedInRecentCommits: mentionedInCommits,
-				patchNotes,
-				githubReleasesUrl: 'https://github.com/n8n-io/n8n/releases',
-				githubCommitsUrl: 'https://github.com/n8n-io/n8n/commits/master/packages/nodes-base/nodes',
-				success: true,
-			});
+			);
 		}
 
-		return results;
-		
-	} catch (error) {
-		throw new Error(`Failed to check base nodes: ${error instanceof Error ? error.message : String(error)}`);
+		results.push({
+			type: 'base',
+			nodeType,
+			nodeName,
+			mentionedInRecentReleases: mentionedInReleases,
+			mentionedInRecentCommits: mentionedInCommits,
+			patchNotes,
+			githubReleasesUrl,
+			githubCommitsUrl: nodesCommitsUrl,
+			success: true,
+		});
 	}
+
+	return results;
 }
 
-function extractPatchNotesFromGitHub(
-	releases: any[],
-	commits: any[],
+function extractRelevantChangelog(
+	changelogContent: string,
+	previousVersion: string,
+	currentVersion: string,
+): string {
+	// Find content between versions
+	const lines = changelogContent.split('\n');
+	const relevantLines: string[] = [];
+	let capturing = false;
+
+	for (const line of lines) {
+		if (line.includes(currentVersion)) {
+			capturing = true;
+		}
+		if (capturing) {
+			relevantLines.push(line);
+		}
+		if (previousVersion && line.includes(previousVersion)) {
+			break;
+		}
+		// Limit to 50 lines
+		if (relevantLines.length > 50) break;
+	}
+
+	return relevantLines.join('\n').substring(0, 2000);
+}
+
+function extractPatchNotesFromContent(
+	releasesContent: string,
+	commitsContent: string,
 	nodeName: string,
 ): string {
 	const notes: string[] = [];
-	const lowerNodeName = nodeName.toLowerCase();
 	
 	// Extract from releases
-	for (const release of releases) {
-		const releaseText = `${release.name || ''} ${release.body || ''}`;
-		if (releaseText.toLowerCase().includes(lowerNodeName)) {
-			const snippet = extractContextSnippet(releaseText, nodeName, 300);
-			if (snippet) {
-				notes.push(`**Release ${release.name || release.tag_name}:**\n${snippet}`);
-			}
-			if (notes.length >= 2) break; // Limit to 2 releases
-		}
+	const releaseSnippet = extractContextSnippet(releasesContent, nodeName, 300);
+	if (releaseSnippet) {
+		notes.push('**From Releases:**\n' + releaseSnippet);
 	}
 
 	// Extract from commits
-	let commitCount = 0;
-	for (const commit of commits) {
-		const message = commit.commit?.message || '';
-		if (message.toLowerCase().includes(lowerNodeName)) {
-			notes.push(`**Commit:** ${message.split('\n')[0]}`);
-			commitCount++;
-			if (commitCount >= 3) break; // Limit to 3 commits
-		}
+	const commitSnippet = extractContextSnippet(commitsContent, nodeName, 300);
+	if (commitSnippet) {
+		notes.push('**From Recent Commits:**\n' + commitSnippet);
 	}
 
-	return notes.join('\n\n') || 'Mentioned in recent updates';
+	return notes.join('\n\n');
 }
 
 function extractContextSnippet(content: string, searchTerm: string, maxLength: number = 200): string {
